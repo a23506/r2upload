@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+
+# ========== 默认值（先于 set -u，避免未绑定变量） ==========
+R2_BUCKET=""
+R2_ENDPOINT=""
+R2_PREFIX=""
+THREADS=4
+RETRIES=3
+LOG_FILE="$HOME/r2upload.log"
+COMPRESS=0
+SPLIT_SIZE=""
+KEEP_ARCHIVE=0
+
+# 读取用户配置（可覆盖上面的默认值）
+# ~/.r2upload.conf 示例：
+#   R2_BUCKET="file"
+#   R2_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
+#   R2_PREFIX="backup/"
+if [[ -f "$HOME/.r2upload.conf" ]]; then
+  # shellcheck disable=SC1090
+  source "$HOME/.r2upload.conf"
+fi
+
+set -euo pipefail
+
+# ================= 帮助 =================
+usage() {
+cat <<'EOF'
+用法:
+  r2upload [选项] <文件/目录 ...>
+
+示例:
+  r2upload -b mybucket -e https://<acct>.r2.cloudflarestorage.com file.txt
+  r2upload -b mybucket -e https://<acct>.r2.cloudflarestorage.com -z -S 1G /data
+  # 若在 ~/.r2upload.conf 已设置 R2_BUCKET/R2_ENDPOINT，则可直接：
+  r2upload file.txt
+  r2upload -z /data
+
+选项:
+  -b, --bucket NAME       存储桶名（可在配置文件中预设）
+  -e, --endpoint URL      Endpoint（可在配置文件中预设，不带 /bucket）
+  -p, --prefix PREFIX     对象 key 前缀（可选）
+  -t, --threads N         并行度（默认 4）
+  -r, --retries N         重试次数（默认 3）
+  -l, --log FILE          日志文件（默认 ~/r2upload.log）
+  -z, --compress          上传前压缩目录（tar.gz）
+  -S, --split SIZE        压缩后分卷大小（仅在 -z 时生效，如 1G、500M）
+  -K, --keep-archive      上传后保留压缩包
+  -h, --help              帮助
+EOF
+}
+
+log()   { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE" >&2; }
+fatal() { log "错误: $*"; exit 1; }
+
+# ================= 上传函数（实时进度 + 写日志） =================
+aws_cp() {
+  local src="$1"; local key="$2"
+  local size
+  size=$(stat -c%s "$src" 2>/dev/null || echo 0)
+
+  for ((i=1; i<=RETRIES; i++)); do
+    log "上传: $src -> s3://$R2_BUCKET/$key (第 $i 次)"
+    # 将 stdout/stderr 同时 tee 到日志，并保留 exit code
+    aws --endpoint-url="$R2_ENDPOINT" s3 cp "$src" "s3://$R2_BUCKET/$key"         --expected-size "$size"         2> >(tee -a "$LOG_FILE" >&2) | tee -a "$LOG_FILE"
+    rc=${PIPESTATUS[0]}
+    if [[ $rc -eq 0 ]]; then
+      log "成功: $key"
+      return 0
+    fi
+    sleep 2
+  done
+
+  log "失败: $key（已重试 $RETRIES 次）"
+  return 1
+}
+
+upload_dir_recursive() {
+  local dir="$1"
+  log "目录上传: $dir"
+  for ((i=1; i<=RETRIES; i++)); do
+    aws --endpoint-url="$R2_ENDPOINT" s3 cp "$dir" "s3://$R2_BUCKET/$R2_PREFIX" --recursive         2> >(tee -a "$LOG_FILE" >&2) | tee -a "$LOG_FILE"
+    rc=${PIPESTATUS[0]}
+    if [[ $rc -eq 0 ]]; then
+      log "目录上传完成: $dir"
+      return 0
+    fi
+    sleep 2
+  done
+  log "目录上传失败: $dir"
+  return 1
+}
+
+compress_and_upload_dir() {
+  local dir="$1"
+  local base; base="$(basename "$dir")"
+  local ts; ts="$(date '+%Y%m%d-%H%M%S')"
+  local tarball="${base}-${ts}.tar.gz"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  local work="$tmpdir/$tarball"
+
+  log "打包目录: $dir -> $work"
+  tar -C "$(dirname "$dir")" -czf "$work" "$base"
+
+  if [[ -n "$SPLIT_SIZE" ]]; then
+    log "按 ${SPLIT_SIZE} 分卷"
+    split -b "$SPLIT_SIZE" -d -a 3 "$work" "$work.part."
+    rm -f "$work"
+    # 分卷逐个上传（保留进度输出）
+    for part in "$tmpdir"/*.part.*; do
+      aws_cp "$part" "${R2_PREFIX}$(basename "$part")"
+    done
+  else
+    aws_cp "$work" "${R2_PREFIX}${tarball}"
+  fi
+
+  if [[ "$KEEP_ARCHIVE" -eq 0 ]]; then
+    rm -rf "$tmpdir"
+  else
+    log "保留压缩包: $tmpdir"
+  fi
+}
+
+upload_file() {
+  local f="$1"
+  aws_cp "$f" "${R2_PREFIX}$(basename "$f")"
+}
+
+# ================= 参数解析 =================
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -b|--bucket)   [[ -n "${2:-}" ]] || { usage; fatal "选项 -b 缺少参数"; }; R2_BUCKET="$2"; shift 2;;
+    -e|--endpoint) [[ -n "${2:-}" ]] || { usage; fatal "选项 -e 缺少参数"; }; R2_ENDPOINT="$2"; shift 2;;
+    -p|--prefix)   [[ -n "${2:-}" ]] || { usage; fatal "选项 -p 缺少参数"; }; R2_PREFIX="$2"; shift 2;;
+    -t|--threads)  [[ -n "${2:-}" ]] || { usage; fatal "选项 -t 缺少参数"; }; THREADS="$2"; shift 2;;
+    -r|--retries)  [[ -n "${2:-}" ]] || { usage; fatal "选项 -r 缺少参数"; }; RETRIES="$2"; shift 2;;
+    -l|--log)      [[ -n "${2:-}" ]] || { usage; fatal "选项 -l 缺少参数"; }; LOG_FILE="$2"; shift 2;;
+    -z|--compress) COMPRESS=1; shift;;
+    -S|--split)    [[ -n "${2:-}" ]] || { usage; fatal "选项 -S 缺少参数"; }; SPLIT_SIZE="$2"; shift 2;;
+    -K|--keep-archive) KEEP_ARCHIVE=1; shift;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) fatal "未知选项: $1";;
+    *)  ARGS+=("$1"); shift;;
+  esac
+done
+
+# ================= 参数检查 =================
+# 无任何路径 → 显示使用示例
+if [[ ${#ARGS[@]} -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+# 必要参数检查（允许从配置文件获得）
+if [[ -z "$R2_BUCKET" || -z "$R2_ENDPOINT" ]]; then
+  echo
+  fatal "参数缺失：必须提供 -b <bucket>、-e <endpoint>（或在 ~/.r2upload.conf 中预设）"
+  echo
+  usage
+  exit 1
+fi
+
+# 去掉 endpoint 末尾的 /bucket（用户误写时自动修正）
+if [[ "$R2_ENDPOINT" =~ /(.*)$ ]] && [[ "${BASH_REMATCH[1]}" == "$R2_BUCKET" ]]; then
+  R2_ENDPOINT="${R2_ENDPOINT%/$R2_BUCKET}"
+fi
+
+# 规范化 prefix
+if [[ -n "$R2_PREFIX" ]]; then
+  R2_PREFIX="${R2_PREFIX#/}"
+  [[ "$R2_PREFIX" == */ ]] || R2_PREFIX="${R2_PREFIX}/"
+fi
+
+# 依赖检查
+command -v aws >/dev/null 2>&1 || fatal "未检测到 awscli，请先安装并通过 aws configure 写入 AK/SK"
+
+# ================= 执行上传 =================
+log "===== 开始上传 ====="
+log "Bucket=$R2_BUCKET Endpoint=$R2_ENDPOINT Prefix=${R2_PREFIX:-<空>} Threads=$THREADS Retries=$RETRIES Compress=$COMPRESS Split=${SPLIT_SIZE:-无}"
+
+for path in "${ARGS[@]}"; do
+  [[ -e "$path" ]] || fatal "路径不存在: $path"
+  if [[ -d "$path" ]]; then
+    if [[ "$COMPRESS" -eq 1 ]]; then
+      compress_and_upload_dir "$path"
+    else
+      upload_dir_recursive "$path"
+    fi
+  else
+    upload_file "$path"
+  fi
+done
+
+log "===== 全部完成 ====="
